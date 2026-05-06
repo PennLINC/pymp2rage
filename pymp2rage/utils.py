@@ -152,28 +152,53 @@ def MP2RAGE_lookuptable(
 
     Signal = np.zeros((len(T1vector), 2))
 
-    for j, T1 in enumerate(T1vector):
-        if (
-            (np.diff(invtimesAB) >= nZ_bef * FLASH_tr[1] + nZ_aft * FLASH_tr[0])
-            and (invtimesa >= nZ_bef * FLASH_tr[0])
-            and (invtimesb <= (MPRAGE_tr - nZ_aft * FLASH_tr[1]))
-        ):
-            Signal[j, :] = MPRAGEfunc_varyingTR(
-                MPRAGE_tr,
-                invtimesAB,
-                nZslices2,
-                FLASH_tr,
-                [flipanglea, flipangleb],
-                sequence,
-                T1,
-                nimages,
-                B0,
-                M0,
-                inversion_efficiency,
-            )
+    # Timing-feasibility check. This depends only on sequence geometry
+    # (MPRAGE_tr, invtimesAB, FLASH_tr, nZslices), not on T1, so evaluate it
+    # once. If it fails, the lookup table cannot be built; raise instead of
+    # silently returning zeros (which previously turned a parameter mistake
+    # into a confusing IndexError downstream in MP2RAGE.fit_t1).
+    interblock_gap = float(np.squeeze(np.diff(invtimesAB)))
+    pre_first_readout = float(np.squeeze(nZ_bef * FLASH_tr[0]))
+    post_last_readout = float(np.squeeze(nZ_aft * FLASH_tr[1]))
+    inter_readout_gap = float(np.squeeze(nZ_bef * FLASH_tr[1] + nZ_aft * FLASH_tr[0]))
 
-        else:
-            Signal[j, :] = 0
+    if not (
+        (interblock_gap >= inter_readout_gap)
+        and (invtimesa >= pre_first_readout)
+        and (invtimesb <= MPRAGE_tr - post_last_readout)
+    ):
+        raise ValueError(
+            'MP2RAGE timing parameters are infeasible: the two readout blocks '
+            'do not fit inside the requested inversion times / outer TR. '
+            f'Got MPRAGE_tr={MPRAGE_tr}, invtimesAB={tuple(invtimesAB)}, '
+            f'FLASH_tr={tuple(np.atleast_1d(FLASH_tr).tolist())}, '
+            f'nZslices={tuple(np.atleast_1d(nZslices).tolist())}. '
+            'Required (in seconds): '
+            f'invtimesAB[0] >= nZ_bef*FLASH_tr[0] '
+            f'(here {invtimesa:.6g} >= {pre_first_readout:.6g}); '
+            f'invtimesAB[1] <= MPRAGE_tr - nZ_aft*FLASH_tr[1] '
+            f'(here {invtimesb:.6g} <= {MPRAGE_tr - post_last_readout:.6g}); '
+            f'diff(invtimesAB) >= nZ_bef*FLASH_tr[1] + nZ_aft*FLASH_tr[0] '
+            f'(here {interblock_gap:.6g} >= {inter_readout_gap:.6g}). '
+            'A common cause is mixing up RepetitionTimePreparation (the outer '
+            'MP2RAGE TR -> MPRAGE_tr, ~5-8 s) with RepetitionTimeExcitation '
+            '(the inner FLASH/excitation TR -> FLASH_tr, ~5-7 ms).'
+        )
+
+    for j, T1 in enumerate(T1vector):
+        Signal[j, :] = MPRAGEfunc_varyingTR(
+            MPRAGE_tr,
+            invtimesAB,
+            nZslices2,
+            FLASH_tr,
+            [flipanglea, flipangleb],
+            sequence,
+            T1,
+            nimages,
+            B0,
+            M0,
+            inversion_efficiency,
+        )
 
     Intensity = np.squeeze(
         np.real(Signal[..., 0] * np.conj(Signal[..., 1]))
@@ -183,6 +208,15 @@ def MP2RAGE_lookuptable(
     if all_data == 0:
         minindex = np.argmax(Intensity)
         maxindex = np.argmin(Intensity)
+        if maxindex - minindex < 1:
+            raise ValueError(
+                'MP2RAGE lookup table is degenerate: could not isolate a '
+                f'monotonic segment between argmax (idx={minindex}) and argmin '
+                f'(idx={maxindex}) of the unified-image intensity over T1 in '
+                f'[{T1vector[0]:.3g}, {T1vector[-1]:.3g}] s. Check that '
+                'MPRAGE_tr, invtimesAB, flipangleABdegree, FLASH_tr, and '
+                'nZslices match the actual acquisition.'
+            )
         Intensity = Intensity[minindex : maxindex + 1]
         T1vector = T1vector[minindex : maxindex + 1]
         IntensityBeforeComb = Signal[minindex : maxindex + 1]

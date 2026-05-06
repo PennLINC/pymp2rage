@@ -54,6 +54,14 @@ class MP2RAGE:
         Magnitude image of second inversion pulse. Should always consist of one volume.
     inv2ph : filename or Nifti1Image, optional
         Phase image of second inversion pulse. Should always consist of one volume.
+    uni : filename or Nifti1Image, optional
+        Pre-computed (signed) MP2RAGE unified image, e.g. the scanner-reconstructed
+        UNI / UNIT1 volume in BIDS BEP001. Recommended whenever phase images are not
+        available, because the unified image cannot be reconstructed correctly from
+        magnitude-only INV1 / INV2 (see Notes).
+        Scaling is auto-detected: if max(abs(.)) > 1 the volume is assumed to be in
+        the Siemens integer range [0, 4095] (mapping to [-0.5, 0.5]); otherwise it
+        is assumed to already be in [-0.5, 0.5].
     B1_fieldmap : filename or Nifti1Image, optional
         B1 fieldmap that indicates the ratio or percentage of the real versus intended flip angle.
         Can be used to correct T1-weighted image and T1 map for B1+ inhomogenieties.
@@ -68,6 +76,25 @@ class MP2RAGE:
         Quantitative T1 map, masked
     t1w_uni_masked : Nifti1Image
         Bias-field corrected T1-weighted map, masked
+
+    Notes
+    -----
+    The unified image is defined as
+
+        UNI = real(INV1 * conj(INV2)) / (|INV1|^2 + |INV2|^2)
+
+    and is monotonic in T1 over [-0.5, 0.5]. With proper phase-sensitive coil
+    combination the sign of UNI is what discriminates short-T1 tissues
+    (UNI > 0) from long-T1 tissues such as CSF (UNI < 0). When only magnitude
+    INV1 / INV2 are provided, UNI collapses to |INV1| * |INV2| / (|INV1|^2 +
+    |INV2|^2), which is constrained to [0, 0.5]: the long-T1 branch is
+    aliased onto the short-T1 branch and CSF (true T1 ~3-4 s) is mapped to
+    the smallest T1 in the lookup vector. This is a fundamental information
+    loss that pymp2rage shares with qMRLab's magnitude-only path
+    (https://github.com/qMRLab/qMRLab/pull/498). The Marques reference
+    scripts therefore require either the phase images or a scanner-
+    reconstructed signed UNI image; if you only have magnitudes, pass the
+    UNI image via the ``uni`` argument here.
     """
 
     def __init__(
@@ -86,6 +113,7 @@ class MP2RAGE:
         inv1ph=None,
         inv2=None,
         inv2ph=None,
+        uni=None,
         B1_fieldmap=None,
     ):
         if inv1_combined is not None:
@@ -147,6 +175,23 @@ class MP2RAGE:
         self._t1map_masked = None
         self._t1w_uni_masked = None
 
+        # If a pre-computed (signed) UNI image is supplied, use it directly
+        # and skip the INV1 * INV2 recombination in fit_t1w_uni. This is the
+        # only correct route when phase images are unavailable, because the
+        # magnitude-only recombination cannot represent UNI < 0 (long-T1
+        # tissues such as CSF). See the class docstring "Notes" section.
+        if uni is not None:
+            uni_img = image.load_img(uni, dtype=np.double)
+            uni_arr = uni_img.get_fdata()
+            # Auto-detect scaling, mirroring JosePMarques/T1estimateMP2RAGE.m:
+            # an integer-encoded Siemens UNI is in roughly [0, 4095]; a
+            # software-computed UNI is already in [-0.5, 0.5].
+            if np.nanmax(np.abs(uni_arr)) > 1:
+                uni_scaled = np.clip(uni_arr.astype(np.double), 0, 4095)
+            else:
+                uni_scaled = np.clip((uni_arr.astype(np.double) + 0.5) * 4095, 0, 4095)
+            self._t1w_uni = nb.Nifti1Image(uni_scaled, uni_img.affine, uni_img.header)
+
         if B1_fieldmap is not None:
             self.b1 = nb.load(B1_fieldmap)
             self.b1 = image.resample_to_img(self.b1, self.inv1)
@@ -164,11 +209,32 @@ class MP2RAGE:
         return image.math_img('1./t1', t1=self._t1map)
 
     def fit_t1w_uni(self):
+        # If a pre-computed signed UNI image was supplied at construction
+        # time it has already been stored (rescaled to [0, 4095]) in
+        # __init__; nothing to do here.
+        if self._t1w_uni is not None:
+            return self._t1w_uni
+
         if hasattr(self, 'inv1ph') and hasattr(self, 'inv2ph'):
             compINV1 = self.inv1.get_fdata() * np.exp(self.inv1ph.get_fdata() * 1j)
             compINV2 = self.inv2.get_fdata() * np.exp(self.inv2ph.get_fdata() * 1j)
         else:
-            # see https://github.com/qMRLab/qMRLab/pull/498
+            # Magnitude-only path. This matches qMRLab's `allMagbutUNI`
+            # branch (see https://github.com/qMRLab/qMRLab/pull/498) but
+            # does NOT recover the negative UNI branch -- |INV1|*|INV2|
+            # / (|INV1|^2 + |INV2|^2) is constrained to [0, 0.5], so any
+            # tissue whose true (signed) UNI is < 0 (typically T1 longer
+            # than the TI1 null, e.g. CSF) gets aliased onto the
+            # short-T1 branch and the resulting T1 estimate is wrong.
+            # If you have access to the scanner-reconstructed signed UNI
+            # image, pass it via the `uni=` constructor argument.
+            logging.warning(
+                'fit_t1w_uni: only magnitude INV1 / INV2 supplied. The '
+                'reconstructed UNI is constrained to [0, 0.5] and cannot '
+                'represent long-T1 tissues (CSF will be assigned an '
+                'incorrectly short T1). Provide phase images, or pass a '
+                'pre-computed signed UNI image via the `uni` argument.'
+            )
             compINV1 = self.inv1.get_fdata()
             compINV2 = self.inv2.get_fdata()
 
